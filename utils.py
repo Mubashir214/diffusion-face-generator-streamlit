@@ -1,59 +1,83 @@
-import streamlit as st
 import torch
-import numpy as np
-from model import UNet
-from utils import sample_with_steps, denormalize
 from config import Config
 
-# =========================
-# Config
-# =========================
 cfg = Config()
 
-st.set_page_config(page_title="DDPM Image Generator", layout="wide")
+# =========================
+# Noise Schedule
+# =========================
+def linear_beta_schedule(timesteps):
+    return torch.linspace(0.0001, 0.02, timesteps)
 
-st.title("🧠 DDPM Image Generation from Noise")
-st.write("Generate images using reverse diffusion process")
+betas = linear_beta_schedule(cfg.TIMESTEPS)
+alphas = 1. - betas
+alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
 
 # =========================
-# Load Model
+# Helper: extract values at timestep
 # =========================
-@st.cache_resource
-def load_model():
-    model = UNet(cfg.CHANNELS)
-    model.load_state_dict(torch.load("ddpm_weights_only.pth", map_location="cpu"))
-    model.eval()
-    return model
-
-model = load_model()
+def extract(a, t, x_shape):
+    b = t.shape[0]
+    out = a.gather(-1, t.cpu())
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 # =========================
-# Generate Button
+# Forward Diffusion (noise addition)
 # =========================
-if st.button("🎨 Generate Image from Noise"):
+def q_sample(x_start, t, noise=None):
+    if noise is None:
+        noise = torch.randn_like(x_start)
 
-    st.subheader("🔄 Intermediate Denoising Steps")
+    sqrt_alpha = extract(sqrt_alphas_cumprod, t, x_start.shape)
+    sqrt_one_minus = extract(sqrt_one_minus_alphas_cumprod, t, x_start.shape)
 
-    # START FROM RANDOM NOISE → GENERATION
-    steps = sample_with_steps(
-        model,
-        (1, cfg.CHANNELS, cfg.IMG_SIZE, cfg.IMG_SIZE)
+    return sqrt_alpha * x_start + sqrt_one_minus * noise
+
+# =========================
+# Reverse Step (denoising)
+# =========================
+@torch.no_grad()
+def p_sample(model, x, t, t_index):
+    betas_t = extract(betas, t, x.shape)
+    sqrt_recip_alphas = extract(1.0 / torch.sqrt(alphas), t, x.shape)
+    sqrt_one_minus = extract(sqrt_one_minus_alphas_cumprod, t, x.shape)
+
+    model_mean = sqrt_recip_alphas * (
+        x - betas_t * model(x, t) / sqrt_one_minus
     )
 
-    # Show intermediate steps (REQUIRED)
-    cols = st.columns(len(steps))
+    if t_index == 0:
+        return model_mean
+    else:
+        noise = torch.randn_like(x)
+        return model_mean + torch.sqrt(betas_t) * noise
 
-    for i, img in enumerate(steps):
-        img = denormalize(img[0]).clamp(0, 1)
-        img = img.permute(1, 2, 0).cpu().numpy()
-        cols[i].image(img, caption=f"Step {i+1}")
+# =========================
+# Full Sampling (Noise → Image)
+# =========================
+@torch.no_grad()
+def sample_with_steps(model, shape):
+    device = "cpu"
+    img = torch.randn(shape, device=device)
 
-    # FINAL OUTPUT
-    st.subheader("🖼️ Final Generated Image")
+    steps = []
+    step_interval = max(1, cfg.TIMESTEPS // 5)  # show ~5 steps
 
-    final_img = denormalize(steps[-1][0]).clamp(0, 1)
-    final_img = final_img.permute(1, 2, 0).cpu().numpy()
+    for i in reversed(range(cfg.TIMESTEPS)):
+        t = torch.full((shape[0],), i, dtype=torch.long, device=device)
+        img = p_sample(model, img, t, i)
 
-    st.image(final_img, use_container_width=True)
+        if i % step_interval == 0:
+            steps.append(img.clone())
 
-    st.success("Image generated successfully from random noise!")
+    return steps
+
+# =========================
+# Denormalization
+# =========================
+def denormalize(x):
+    x = (x + 1) / 2
+    return torch.clamp(x, 0, 1)
