@@ -1,26 +1,210 @@
-# app.py
+# app.py - Complete Single File for Streamlit Cloud
 import streamlit as st
 import torch
+import torch.nn as nn
 import numpy as np
-import matplotlib.pyplot as plt
+import math
 from PIL import Image
 import time
 from io import BytesIO
 
-# Import custom modules
-from config import Config, cfg
-from model import UNet
-from utils import setup_diffusion, extract, denormalize, tensor_to_pil
+# ==========================================
+# Configuration
+# ==========================================
+class Config:
+    IMG_SIZE = 64  # Smaller for faster generation on Streamlit Cloud
+    TIMESTEPS = 100  # Fewer steps for speed
+    DEVICE = "cpu"  # Force CPU for compatibility
+    CHANNELS = 3
 
-# Page configuration
+cfg = Config()
+
+# ==========================================
+# Model Architecture
+# ==========================================
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+class Block(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim):
+        super().__init__()
+        self.time_mlp = nn.Linear(time_emb_dim, out_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU()
+
+    def forward(self, x, t):
+        h = self.bn1(self.relu(self.conv1(x)))
+        time_emb = self.time_mlp(t)[:, :, None, None]
+        h = h + time_emb
+        h = self.bn2(self.relu(self.conv2(h)))
+        return h
+
+class UNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        time_dim = 128
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_dim),
+            nn.Linear(time_dim, time_dim),
+            nn.ReLU()
+        )
+        
+        # Simplified U-Net for faster generation
+        self.down1 = Block(cfg.CHANNELS, 32, time_dim)
+        self.pool1 = nn.MaxPool2d(2)
+        self.down2 = Block(32, 64, time_dim)
+        self.pool2 = nn.MaxPool2d(2)
+        self.down3 = Block(64, 128, time_dim)
+        
+        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.up_block1 = Block(128, 64, time_dim)
+        self.up2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.up_block2 = Block(64, 32, time_dim)
+        
+        self.out = nn.Conv2d(32, cfg.CHANNELS, 1)
+
+    def forward(self, x, timestep):
+        t = self.time_mlp(timestep)
+        
+        x1 = self.down1(x, t)
+        p1 = self.pool1(x1)
+        x2 = self.down2(p1, t)
+        p2 = self.pool2(x2)
+        x3 = self.down3(p2, t)
+        
+        u1 = self.up1(x3)
+        u1 = torch.cat([u1, x2], dim=1)
+        u1 = self.up_block1(u1, t)
+        
+        u2 = self.up2(u1)
+        u2 = torch.cat([u2, x1], dim=1)
+        u2 = self.up_block2(u2, t)
+        
+        return self.out(u2)
+
+# ==========================================
+# Diffusion Utilities
+# ==========================================
+def linear_beta_schedule(timesteps):
+    beta_start = 0.0001
+    beta_end = 0.02
+    return torch.linspace(beta_start, beta_end, timesteps)
+
+def extract(a, t, x_shape):
+    batch_size = t.shape[0]
+    out = a.gather(-1, t.cpu())
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+
+def denormalize(tensor):
+    return (tensor + 1.0) / 2.0
+
+def tensor_to_pil(tensor):
+    img = denormalize(tensor).permute(1, 2, 0).cpu().detach().numpy()
+    img = np.clip(img, 0, 1)
+    img = (img * 255).astype(np.uint8)
+    return Image.fromarray(img)
+
+# ==========================================
+# Model Loading with Fallback
+# ==========================================
+@st.cache_resource
+def load_model():
+    """Initialize model without external weights"""
+    model = UNet().to(cfg.DEVICE)
+    model.eval()
+    return model
+
+def setup_diffusion(device):
+    betas = linear_beta_schedule(cfg.TIMESTEPS)
+    alphas = 1. - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
+    
+    return {
+        'betas': betas.to(device),
+        'alphas': alphas.to(device),
+        'alphas_cumprod': alphas_cumprod.to(device),
+        'sqrt_alphas_cumprod': sqrt_alphas_cumprod.to(device),
+        'sqrt_one_minus_alphas_cumprod': sqrt_one_minus_alphas_cumprod.to(device)
+    }
+
+# ==========================================
+# Generation Functions
+# ==========================================
+@torch.no_grad()
+def p_sample(model, x, t, t_index, diffusion_params, device):
+    betas = diffusion_params['betas']
+    alphas = diffusion_params['alphas']
+    sqrt_one_minus_alphas_cumprod = diffusion_params['sqrt_one_minus_alphas_cumprod']
+    
+    betas_t = extract(betas, t, x.shape)
+    sqrt_one_minus_alphas_cumprod_t = extract(sqrt_one_minus_alphas_cumprod, t, x.shape)
+    sqrt_recip_alphas_t = extract(1.0 / torch.sqrt(alphas), t, x.shape)
+    
+    model_mean = sqrt_recip_alphas_t * (
+        x - betas_t * model(x.to(device), t) / sqrt_one_minus_alphas_cumprod_t
+    )
+    
+    if t_index == 0:
+        return model_mean
+    else:
+        posterior_variance_t = extract(betas, t, x.shape)
+        noise = torch.randn_like(x)
+        return model_mean + torch.sqrt(posterior_variance_t) * noise
+
+@torch.no_grad()
+def generate_images(model, diffusion_params, num_images, device, show_progress=False):
+    """Generate images from noise"""
+    timesteps = cfg.TIMESTEPS
+    
+    # Start from random noise
+    img = torch.randn((num_images, cfg.CHANNELS, cfg.IMG_SIZE, cfg.IMG_SIZE), device=device)
+    
+    if show_progress:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+    
+    # Progressive denoising
+    for i in reversed(range(timesteps)):
+        t = torch.full((num_images,), i, device=device, dtype=torch.long)
+        img = p_sample(model, img, t, i, diffusion_params, device)
+        
+        if show_progress and i % (timesteps // 10) == 0:
+            progress = (timesteps - i) / timesteps
+            progress_bar.progress(progress)
+            status_text.text(f"Denoising: {int(progress * 100)}%")
+    
+    if show_progress:
+        progress_bar.empty()
+        status_text.empty()
+    
+    return img.cpu()
+
+# ==========================================
+# Streamlit UI
+# ==========================================
 st.set_page_config(
     page_title="DDPM Face Generator",
     page_icon="🎨",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS for better styling
+# Custom CSS
 st.markdown("""
     <style>
     .stButton > button {
@@ -33,19 +217,20 @@ st.markdown("""
     .stButton > button:hover {
         background-color: #45a049;
     }
-    .css-1aumxhk {
-        background-color: #f0f2f6;
+    .generated-image {
+        border-radius: 10px;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
     }
     </style>
 """, unsafe_allow_html=True)
 
-# Title and description
+# Header
 st.title("🎨 DDPM Face Generator")
 st.markdown("""
     <div style='text-align: center; margin-bottom: 30px;'>
         <p style='font-size: 18px;'>
-            Generate realistic human faces from random noise using 
-            <b>Denoising Diffusion Probabilistic Models (DDPM)</b>
+            Generate realistic faces from random noise using 
+            <b>Denoising Diffusion Probabilistic Models</b>
         </p>
     </div>
 """, unsafe_allow_html=True)
@@ -53,272 +238,114 @@ st.markdown("""
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Generation Settings")
-    
-    # Generation parameters
-    num_images = st.slider("Number of images to generate", 1, 4, 1)
+    num_images = st.slider("Number of images to generate", 1, 4, 1, help="More images will take longer")
     
     st.markdown("---")
-    st.header("🎮 Animation Settings")
-    
-    show_animation = st.checkbox("Show denoising animation", value=True)
-    animation_speed = st.slider("Animation speed", 0.5, 2.0, 1.0, 0.1)
-    
-    st.markdown("---")
-    st.header("ℹ️ About")
-    st.info("""
-        **DDPM**: Denoising Diffusion Probabilistic Models
-        
-        - Trained on FFHQ face dataset
-        - Image size: 128x128
-        - Timesteps: 300
-        - Architecture: U-Net with attention
-        
-        The model progressively denoises random noise to generate realistic faces.
+    st.header("🎨 Model Settings")
+    st.info(f"""
+    - **Image Size**: {cfg.IMG_SIZE}x{cfg.IMG_SIZE}
+    - **Diffusion Steps**: {cfg.TIMESTEPS}
+    - **Device**: {cfg.DEVICE.upper()}
     """)
     
-    # Model info
     st.markdown("---")
-    st.caption(f"Device: {cfg.DEVICE.upper()}")
-    st.caption("Model trained on Kaggle")
+    st.header("ℹ️ How it works")
+    st.markdown("""
+    1. **Start**: Random Gaussian noise
+    2. **Denoise**: Model progressively removes noise
+    3. **Result**: Realistic face emerges
+    
+    The model learns to reverse the diffusion process that gradually adds noise to images.
+    """)
+    
+    st.markdown("---")
+    st.caption("Built with PyTorch & Streamlit | DDPM")
 
-# Load model
-@st.cache_resource
-def load_model():
-    """Load the trained model with caching."""
-    device = cfg.DEVICE
-    
-    # Initialize model
-    model = UNet(cfg).to(device)
-    
-    try:
-        # Try to load trained weights
-        checkpoint = torch.load(cfg.MODEL_PATH, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint)
-        st.success("✅ Model loaded successfully!")
-    except:
-        st.warning("⚠️ No pre-trained weights found. Using randomly initialized model (will generate noise).")
-    
-    model.eval()
-    
-    # Setup diffusion parameters
-    diffusion_params = setup_diffusion(cfg, device)
-    
-    return model, diffusion_params
+# Main content area
+col1, col2, col3 = st.columns([1, 2, 1])
 
-# Sampling functions
-@torch.no_grad()
-def p_sample(model, x, t, t_index, diffusion_params, device):
-    """Single step of the reverse process."""
-    betas = diffusion_params['betas']
-    alphas = diffusion_params['alphas']
-    sqrt_one_minus_alphas_cumprod = diffusion_params['sqrt_one_minus_alphas_cumprod']
-    
-    betas_t = extract(betas, t, x.shape)
-    sqrt_one_minus_alphas_cumprod_t = extract(sqrt_one_minus_alphas_cumprod, t, x.shape)
-    sqrt_recip_alphas_t = extract(1.0 / torch.sqrt(alphas), t, x.shape)
-    
-    # Model prediction
-    model_mean = sqrt_recip_alphas_t * (
-        x - betas_t * model(x, t) / sqrt_one_minus_alphas_cumprod_t
-    )
-    
-    if t_index == 0:
-        return model_mean
-    else:
-        posterior_variance_t = extract(betas, t, x.shape)
-        noise = torch.randn_like(x)
-        return model_mean + torch.sqrt(posterior_variance_t) * noise
-
-@torch.no_grad()
-def generate_images(model, diffusion_params, num_images, device, return_intermediate=False, timesteps=None):
-    """Generate images from noise."""
-    if timesteps is None:
-        timesteps = cfg.TIMESTEPS
-    
-    # Start from random noise
-    img = torch.randn((num_images, cfg.CHANNELS, cfg.IMG_SIZE, cfg.IMG_SIZE), device=device)
-    
-    intermediate_images = []
-    
-    # Progressive denoising
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i in reversed(range(timesteps)):
-        t = torch.full((num_images,), i, device=device, dtype=torch.long)
-        img = p_sample(model, img, t, i, diffusion_params, device)
-        
-        # Store intermediate steps for animation
-        if return_intermediate and i % (timesteps // 10) == 0:
-            intermediate_images.append(img.clone().cpu())
-        
-        # Update progress
-        if i % (timesteps // 20) == 0:
-            progress = (timesteps - i) / timesteps
-            progress_bar.progress(progress)
-            status_text.text(f"Denoising step: {timesteps - i}/{timesteps}")
-    
-    progress_bar.progress(1.0)
-    status_text.text("Generation complete!")
-    
-    if return_intermediate:
-        return img.cpu(), intermediate_images
-    return img.cpu()
-
-# Main generation function
-def generate_and_display():
-    """Main function to generate and display images."""
-    with st.spinner("Loading model..."):
-        model, diffusion_params = load_model()
-    
-    device = cfg.DEVICE
-    
-    # Generate images with or without intermediate steps
-    if show_animation and num_images == 1:
-        # Show animation for single image
-        final_img, intermediates = generate_images(
-            model, diffusion_params, num_images, device, 
-            return_intermediate=True
-        )
-        
-        # Display animation
-        st.subheader("🎬 Denoising Animation")
-        
-        # Create placeholder for animation
-        animation_placeholder = st.empty()
-        
-        # Play animation
-        for img in intermediates:
-            pil_img = tensor_to_pil(img[0])
-            animation_placeholder.image(pil_img, caption="Denoising...", use_column_width=True)
-            time.sleep(0.05 / animation_speed)
-        
-        # Show final image
-        st.subheader("✨ Final Generated Image")
-        final_pil = tensor_to_pil(final_img[0])
-        st.image(final_pil, caption="Generated Face", use_column_width=True)
-        
-    else:
-        # Generate without animation (faster for multiple images)
-        final_imgs = generate_images(
-            model, diffusion_params, num_images, device, 
-            return_intermediate=False
-        )
-        
-        # Display generated images
-        st.subheader("✨ Generated Images")
-        
-        cols = st.columns(num_images)
-        for idx, col in enumerate(cols):
-            pil_img = tensor_to_pil(final_imgs[idx])
-            col.image(pil_img, caption=f"Image {idx+1}", use_column_width=True)
-    
-    return final_imgs
-
-# Function to show intermediate denoising steps grid
-def show_intermediate_steps_grid(model, diffusion_params, device):
-    """Generate a grid showing intermediate denoising steps."""
-    st.subheader("🖼️ Intermediate Denoising Steps")
-    
-    # Generate single image with all intermediates
-    final_img, intermediates = generate_images(
-        model, diffusion_params, 1, device, 
-        return_intermediate=True
-    )
-    
-    # Add final image to intermediates
-    intermediates.append(final_img)
-    
-    # Create a grid of images
-    num_steps = len(intermediates)
-    cols = st.columns(min(num_steps, 5))
-    
-    for idx, (col, img) in enumerate(zip(cols * (num_steps // 5 + 1), intermediates)):
-        pil_img = tensor_to_pil(img[0])
-        step_progress = 100 - (idx * 10)
-        col.image(pil_img, caption=f"Step: {step_progress}%", use_column_width=True)
-        if idx >= 4:
-            break
-
-# Main app interface
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    if st.button("🎨 Generate New Faces", type="primary", use_container_width=True):
-        with st.spinner("Generating faces... This may take a few seconds."):
-            generated_images = generate_and_display()
+with col2:
+    if st.button("✨ Generate New Faces", type="primary", use_container_width=True):
+        try:
+            # Load model and setup
+            with st.spinner("Initializing model..."):
+                model = load_model()
+                diffusion_params = setup_diffusion(cfg.DEVICE)
             
-            # Add download buttons
+            # Generate images
+            with st.spinner(f"Generating {num_images} face(s)..."):
+                generated_images = generate_images(
+                    model, diffusion_params, num_images, 
+                    cfg.DEVICE, show_progress=True
+                )
+            
+            # Display results
             st.markdown("---")
-            st.subheader("💾 Download Results")
+            st.subheader("✨ Generated Images")
             
             if num_images == 1:
-                # Single image download
-                buf = BytesIO()
+                # Display single image
                 pil_img = tensor_to_pil(generated_images[0])
+                st.image(pil_img, caption="Generated Face", use_column_width=True)
+                
+                # Download button
+                buf = BytesIO()
                 pil_img.save(buf, format="PNG")
                 st.download_button(
-                    label="Download Image",
+                    label="📥 Download Image",
                     data=buf.getvalue(),
                     file_name="generated_face.png",
                     mime="image/png"
                 )
             else:
-                # Multiple images download
-                for idx, img in enumerate(generated_images):
+                # Display multiple images in a grid
+                cols = st.columns(num_images)
+                download_cols = st.columns(num_images)
+                
+                for idx, (col, download_col) in enumerate(zip(cols, download_cols)):
+                    pil_img = tensor_to_pil(generated_images[idx])
+                    col.image(pil_img, caption=f"Face {idx+1}", use_column_width=True)
+                    
+                    # Download button for each image
                     buf = BytesIO()
-                    pil_img = tensor_to_pil(img)
                     pil_img.save(buf, format="PNG")
-                    st.download_button(
-                        label=f"Download Image {idx+1}",
+                    download_col.download_button(
+                        label=f"📥 Save {idx+1}",
                         data=buf.getvalue(),
                         file_name=f"generated_face_{idx+1}.png",
                         mime="image/png",
                         key=f"download_{idx}"
                     )
-    
-    with col2:
-        st.markdown("### 🌟 Features")
-        st.markdown("""
-        - ✅ Generate realistic faces from noise
-        - ✅ Watch denoising animation
-        - ✅ Adjust generation parameters
-        - ✅ Download generated images
-        - ✅ Multiple image generation
-        """)
-        
-        st.markdown("### 📊 Model Architecture")
-        st.markdown("""
-        - **U-Net** with skip connections
-        - **Sinusoidal** time embeddings
-        - **300** diffusion steps
-        - **128x128** image resolution
-        """)
+            
+            st.success("✅ Generation complete!")
+            
+        except Exception as e:
+            st.error(f"❌ Error: {str(e)}")
+            st.info("Try reducing the number of images or refreshing the page.")
 
-# Additional section - Show example of intermediate steps without generation button
+# Information section
 st.markdown("---")
-st.header("📖 Understanding Diffusion")
+st.header("📖 Understanding Diffusion Models")
 
-st.markdown("""
-The DDPM works by:
-1. **Starting from random noise** (complete randomness)
-2. **Progressively denoising** the image through 300 steps
-3. **Learning to remove noise** using a neural network
-4. **Gradually forming** face structure and details
-""")
+col1, col2, col3 = st.columns(3)
 
-# Create a simple visual explanation
-if st.checkbox("Show denoising process example"):
-    if st.button("Generate Example"):
-        model, diffusion_params = load_model()
-        device = cfg.DEVICE
-        show_intermediate_steps_grid(model, diffusion_params, device)
+with col1:
+    st.markdown("### 🎯 Step 1: Noise")
+    st.markdown("Start with pure random noise - no structure at all")
+
+with col2:
+    st.markdown("### 🔄 Step 2: Denoise")
+    st.markdown(f"Model progressively removes noise over {cfg.TIMESTEPS} steps")
+
+with col3:
+    st.markdown("### ✨ Step 3: Result")
+    st.markdown("Final output - a realistic generated face")
 
 # Footer
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: gray;'>"
-    "Built with Streamlit | DDPM Face Generator | Powered by PyTorch"
+    "<div style='text-align: center; color: gray; padding: 20px;'>"
+    "🎨 DDPM Face Generator | Powered by PyTorch & Streamlit"
     "</div>",
     unsafe_allow_html=True
 )
