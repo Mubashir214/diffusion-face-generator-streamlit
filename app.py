@@ -1,19 +1,20 @@
 import streamlit as st
 import torch
 import numpy as np
+from PIL import Image
+import io
+from torchvision import transforms
+
 from model import UNet
-from utils import sample_with_steps, denormalize
+from utils import sample_with_steps, denormalize, q_sample
 from config import Config
 
-# =====================================
-# Config
-# =====================================
 cfg = Config()
 
 st.set_page_config(page_title="DDPM Face Generator", layout="wide")
 
 st.title("🧠 DDPM Face Generator")
-st.write("Generate faces from random noise and visualize denoising process")
+st.write("Generate faces OR upload image for reconstruction")
 
 # =====================================
 # Load Model
@@ -28,60 +29,69 @@ def load_model():
 model = load_model()
 
 # =====================================
-# Sidebar Controls
+# Sidebar
 # =====================================
 st.sidebar.title("⚙️ Controls")
-generate_btn = st.sidebar.button("🎨 Generate New Face")
+mode = st.sidebar.radio("Select Mode", ["Generate", "Upload & Reconstruct"])
 
 # =====================================
-# Generate Images
+# TRANSFORM
 # =====================================
-if generate_btn:
-    st.subheader("🔄 Denoising Process")
+transform = transforms.Compose([
+    transforms.Resize((cfg.IMG_SIZE, cfg.IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
 
-    with st.spinner("Generating image... please wait ⏳"):
+# =====================================
+# MODE 1: GENERATE FROM NOISE
+# =====================================
+if mode == "Generate":
+    if st.sidebar.button("🎨 Generate Face"):
         steps = sample_with_steps(
             model,
             (1, cfg.CHANNELS, cfg.IMG_SIZE, cfg.IMG_SIZE)
         )
 
-    cols = st.columns(len(steps))
+        cols = st.columns(len(steps))
 
-    for i, img in enumerate(steps):
-        # FIX: Proper normalization + clamp
-        img = denormalize(img[0]).clamp(0, 1)
-        img = img.permute(1, 2, 0).cpu().numpy()
+        for i, img in enumerate(steps):
+            img = denormalize(img[0]).clamp(0,1)
+            img = img.permute(1,2,0).cpu().numpy()
+            cols[i].image(img, caption=f"Step {i}")
 
-        cols[i].image(img, caption=f"Step {i}", use_container_width=True)
+        final_img = denormalize(steps[-1][0]).clamp(0,1)
+        final_img = final_img.permute(1,2,0).cpu().numpy()
 
-    st.success("✅ Final Image Generated!")
-
-    # Show final image bigger
-    st.subheader("🖼️ Final Output")
-    final_img = denormalize(steps[-1][0]).clamp(0, 1)
-    final_img = final_img.permute(1, 2, 0).cpu().numpy()
-
-    st.image(final_img, use_container_width=True)
-
-    # =====================================
-    # Download Button
-    # =====================================
-    import io
-    from PIL import Image
-
-    img_pil = Image.fromarray((final_img * 255).astype(np.uint8))
-    buf = io.BytesIO()
-    img_pil.save(buf, format="PNG")
-
-    st.download_button(
-        label="📥 Download Image",
-        data=buf.getvalue(),
-        file_name="generated_face.png",
-        mime="image/png"
-    )
+        st.image(final_img, caption="Final Output")
 
 # =====================================
-# Footer
+# MODE 2: UPLOAD + RECONSTRUCT
 # =====================================
-st.markdown("---")
-st.markdown("👨‍💻 Built with PyTorch + Streamlit")
+elif mode == "Upload & Reconstruct":
+    uploaded_file = st.file_uploader("Upload an image", type=["png","jpg","jpeg"])
+
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file).convert("RGB")
+        st.image(image, caption="Original Image")
+
+        img_tensor = transform(image).unsqueeze(0)
+
+        if st.button("Reconstruct Image"):
+            t = torch.tensor([cfg.TIMESTEPS//2])
+
+            # Add noise
+            noisy = q_sample(img_tensor, t)
+
+            # Denoise
+            steps = sample_with_steps(
+                model,
+                img_tensor.shape
+            )
+
+            recon = steps[-1]
+
+            recon_img = denormalize(recon[0]).clamp(0,1)
+            recon_img = recon_img.permute(1,2,0).cpu().numpy()
+
+            st.image(recon_img, caption="Reconstructed Image")
