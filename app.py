@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import torch
 import numpy as np
@@ -32,7 +31,6 @@ model = load_model()
 # Sidebar Controls
 # =====================================
 st.sidebar.title("⚙️ Controls")
-
 generate_btn = st.sidebar.button("🎨 Generate New Face")
 
 # =====================================
@@ -87,4 +85,3 @@ if generate_btn:
 # =====================================
 st.markdown("---")
 st.markdown("👨‍💻 Built with PyTorch + Streamlit")
-```
